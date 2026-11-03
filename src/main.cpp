@@ -201,7 +201,7 @@ void loop() {
     display.setCursor(0, 15);
     display.print("Mode: ");
     if (currentMode == MODE_MODBUS) display.print("1.Modbuss");
-    else if (currentMode == MODE_STEP_DIR) display.print("2.Step/Dir");
+    else if (currentMode == MODE_STEP_DIR) display.print("2.Step/Dirrr/");
     else display.print("3.Manual");
 
     display.setCursor(0, 35);
