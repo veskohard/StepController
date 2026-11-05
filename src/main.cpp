@@ -1,1042 +1,710 @@
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
+#include <SPI.h>
 #include <math.h>
 
 // =====================================================
-// 1. ОСНОВНИ НАСТРОЙКИ
+// OLED SSD1306 128x64 - SOFTWARE SPI
 // =====================================================
+
+#define OLED_CLK   PA5
+#define OLED_MOSI  PA7
+#define OLED_CS    PA4
+#define OLED_DC    PB5
+#define OLED_RES   PB0
+
+U8G2_SSD1306_128X64_NONAME_F_4W_SW_SPI display(
+    U8G2_R0,
+    OLED_CLK,
+    OLED_MOSI,
+    OLED_CS,
+    OLED_DC,
+    OLED_RES
+);
+
+// =====================================================
+// MOTOR L298N
+// =====================================================
+
+#define IN1 PA0
+#define IN2 PA1
+#define IN3 PA2
+#define IN4 PA3
 
 #define MOTOR_STEPS_PER_REV 200
 
 #define MAX_RPM 300.0f
 #define MIN_RPM 30.0f
-
-// Ускорение: 60 RPM за секунда
 #define ACCELERATION_RPM 60.0f
 
-// Обновяване на ускорението
-#define RAMP_INTERVAL_MS 100
-
-// =====================================================
-// 2. РЕЖИМИ
-// =====================================================
-
-enum ControlMode {
-  MODE_MODBUS = 1,
-  MODE_STEP_DIR = 2,
-  MODE_MANUAL = 3
+// Пълна стъпка, две фази включени
+const uint8_t stepTable[4][4] = {
+    {HIGH, LOW,  HIGH, LOW},
+    {LOW,  HIGH, HIGH, LOW},
+    {LOW,  HIGH, LOW,  HIGH},
+    {HIGH, LOW,  LOW,  HIGH}
 };
 
-ControlMode currentMode = MODE_MODBUS;
+int stepIndex = 0;
+int motorDirection = 1;
 
-volatile bool stepDirEnabled = false;
+float targetRPM = 60.0f;
+float currentRPM = 0.0f;
 
-// =====================================================
-// 3. ПИНОВЕ L298N
-// =====================================================
+uint32_t stepIntervalUs = 5000;
+uint32_t lastStepUs = 0;
+uint32_t lastRampMs = 0;
 
-const int IN1 = PA0;
-const int IN2 = PA1;
-const int IN3 = PA2;
-const int IN4 = PA3;
+bool motorRunning = false;
+bool motorRequested = false;
 
-// =====================================================
-// 4. STEP / DIR
-// =====================================================
-
-const int STEP_PIN = PB3;
-const int DIR_PIN = PB4;
-
-volatile uint32_t pendingForwardSteps = 0;
-volatile uint32_t pendingBackwardSteps = 0;
+uint32_t stepsRemaining = 0;
 
 // =====================================================
-// 5. ЕНКОДЕР
+// STEP / DIR INPUT
 // =====================================================
 
-const int ENC_CLK = PB12;
-const int ENC_DT  = PB13;
-const int ENC_SW  = PB14;
+#define STEP_PIN PB3
+#define DIR_PIN  PB4
 
-int lastClkState = HIGH;
-
-// =====================================================
-// 6. ОБЩИ ПАРАМЕТРИ НА МОТОРА
-// =====================================================
-
-float motorRPM = 0.0f;
-
-unsigned long lastRampTime = 0;
-unsigned long lastMotorStepTime = 0;
-
-bool motorEnergized = false;
+volatile uint32_t pendingStepsForward = 0;
+volatile uint32_t pendingStepsBackward = 0;
 
 // =====================================================
-// 7. MANUAL
+// ENCODER
 // =====================================================
 
-bool manualRunRequest = false;
-bool manualDirection = true;
+#define ENC_CLK PB12
+#define ENC_DT  PB13
+#define ENC_SW  PB14
 
-bool manualDirectionPending = false;
-bool pendingDirection = true;
+int lastEncoderCLK = HIGH;
 
-// Начална зададена скорост
-float manualTargetRPM = 60.0f;
+bool lastButtonState = HIGH;
+bool buttonPressed = false;
 
-// Интервал между стъпките
-unsigned long manualStepDelay = 5000;
+uint32_t buttonPressTime = 0;
 
-// Регулиране през 50 микросекунди
-const unsigned long SPEED_STEP_US = 50;
-
-const unsigned long MIN_DELAY_US =
-  60000000UL / (MOTOR_STEPS_PER_REV * 300UL);
-
-const unsigned long MAX_DELAY_US =
-  60000000UL / (MOTOR_STEPS_PER_REV * 30UL);
+const uint32_t SHORT_PRESS_MS = 800;
+const uint32_t LONG_PRESS_MS = 3000;
 
 // =====================================================
-// 8. БУТОН
+// RS485 / MODBUS
 // =====================================================
 
-bool buttonRawState = HIGH;
-bool buttonStableState = HIGH;
+#define RS485_DE_RE PB1
 
-unsigned long buttonDebounceTime = 0;
-unsigned long buttonPressTime = 0;
+#define MODBUS_SLAVE_ID 1
+#define MODBUS_BAUD 9600
 
-const unsigned long DEBOUNCE_MS = 30;
+// USART1: PA9 TX, PA10 RX
+#define RS485_SERIAL Serial1
+
+uint16_t holdingRegisters[16] = {0};
+
+uint8_t modbusBuffer[32];
+uint8_t modbusLength = 0;
+
+uint32_t lastModbusByteMs = 0;
 
 // =====================================================
-// 9. MODBUS / RS485
+// MODES
 // =====================================================
 
-#define RS485_SERIAL Serial
-
-const int MAX485_DE_RE_PIN = PB1;
-
-uint16_t holdingRegisters[16] = {
-  0,       // 0: Steps
-  1,       // 1: Direction
-  2000,    // 2: Delay in us
-  0,       // 3: Start/Stop
-  0, 0, 0, 0, 0, 0,
-  1,       // 10: Mode
-  0, 0, 0, 0, 0
+enum OperatingMode {
+    MODE_MODBUS = 1,
+    MODE_STEP_DIR = 2,
+    MODE_MANUAL = 3
 };
 
-bool mbIsRunning = false;
-bool mbStopRequested = false;
-
-long mbStepsRemaining = 0;
-
-bool mbDirection = true;
-
-float mbTargetRPM = 150.0f;
+OperatingMode currentMode = MODE_MANUAL;
 
 // =====================================================
-// 10. FULL STEP TABLE
+// DISPLAY
 // =====================================================
 
-const int stepTable[4][4] = {
-  {HIGH, LOW,  HIGH, LOW},
-  {LOW,  HIGH, HIGH, LOW},
-  {LOW,  HIGH, LOW,  HIGH},
-  {HIGH, LOW,  LOW,  HIGH}
-};
+uint32_t lastDisplayMs = 0;
 
-int currentStep = 0;
-
-// =====================================================
-// 11. OLED
-// =====================================================
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-
-Adafruit_SSD1306 display(
-  SCREEN_WIDTH,
-  SCREEN_HEIGHT,
-  &Wire,
-  -1
-);
-
-unsigned long lastDisplayUpdate = 0;
-
-// =====================================================
-// 12. ИЗПЪЛНЕНИЕ НА ЕДНА СТЪПКА
-// =====================================================
-
-void executeStep(bool direction) {
-
-  if (direction) {
-    currentStep = (currentStep + 1) % 4;
-  }
-  else {
-    currentStep = (currentStep - 1 + 4) % 4;
-  }
-
-  digitalWrite(IN1, stepTable[currentStep][0]);
-  digitalWrite(IN2, stepTable[currentStep][1]);
-  digitalWrite(IN3, stepTable[currentStep][2]);
-  digitalWrite(IN4, stepTable[currentStep][3]);
-
-  motorEnergized = true;
+const char* getModeName() {
+    switch (currentMode) {
+        case MODE_MANUAL:  return "MANUAL";
+        case MODE_STEP_DIR: return "STEP/DIR";
+        case MODE_MODBUS: return "MODBUS";
+        default: return "UNKNOWN";
+    }
 }
 
 // =====================================================
-// 13. ОСВОБОЖДАВАНЕ НА МОТОРА
+// MOTOR FUNCTIONS
 // =====================================================
 
 void releaseMotor() {
-
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-
-  motorEnergized = false;
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
 }
 
-// =====================================================
-// 14. RPM КЪМ МИКРОСЕКУНДИ
-// =====================================================
+void executeStep(int direction) {
+    stepIndex += direction;
 
-unsigned long rpmToDelay(float rpm) {
+    if (stepIndex > 3) stepIndex = 0;
+    if (stepIndex < 0) stepIndex = 3;
 
-  if (rpm <= 0.0f) return MAX_DELAY_US;
-
-  float delayValue =
-    60000000.0f /
-    (MOTOR_STEPS_PER_REV * rpm);
-
-  return (unsigned long)delayValue;
+    digitalWrite(IN1, stepTable[stepIndex][0]);
+    digitalWrite(IN2, stepTable[stepIndex][1]);
+    digitalWrite(IN3, stepTable[stepIndex][2]);
+    digitalWrite(IN4, stepTable[stepIndex][3]);
 }
 
-// =====================================================
-// 15. МИКРОСЕКУНДИ КЪМ RPM
-// =====================================================
+uint32_t rpmToDelay(float rpm) {
+    if (rpm < MIN_RPM) rpm = MIN_RPM;
+    if (rpm > MAX_RPM) rpm = MAX_RPM;
 
-float delayToRPM(unsigned long delayValue) {
-
-  if (delayValue == 0) return 0;
-
-  return 60000000.0f /
-         (MOTOR_STEPS_PER_REV * delayValue);
+    return (uint32_t)(60000000.0f /
+                      (rpm * MOTOR_STEPS_PER_REV));
 }
 
-// =====================================================
-// 16. ПЛАВНО УСКОРЯВАНЕ И ЗАБАВЯНЕ
-// =====================================================
+float delayToRPM(uint32_t delayUs) {
+    if (delayUs == 0) return MAX_RPM;
 
-void updateMotorRamp(float targetRPM) {
+    float rpm = 60000000.0f /
+                ((float)delayUs * MOTOR_STEPS_PER_REV);
 
-  unsigned long now = millis();
+    if (rpm < MIN_RPM) rpm = MIN_RPM;
+    if (rpm > MAX_RPM) rpm = MAX_RPM;
 
-  if (now - lastRampTime < RAMP_INTERVAL_MS) {
-    return;
-  }
+    return rpm;
+}
 
-  lastRampTime = now;
+void startMotor() {
+    motorRequested = true;
+    motorRunning = true;
 
-  float change =
-    ACCELERATION_RPM *
-    (RAMP_INTERVAL_MS / 1000.0f);
-
-  if (motorRPM < targetRPM) {
-
-    motorRPM += change;
-
-    if (motorRPM > targetRPM) {
-      motorRPM = targetRPM;
+    if (currentRPM < MIN_RPM) {
+        currentRPM = MIN_RPM;
     }
-  }
 
-  else if (motorRPM > targetRPM) {
+    lastStepUs = micros();
+}
 
-    motorRPM -= change;
+void stopMotor() {
+    motorRequested = false;
+}
 
-    if (motorRPM < targetRPM) {
-      motorRPM = targetRPM;
+void setDirection(int direction) {
+    motorDirection = direction >= 0 ? 1 : -1;
+}
+
+// =====================================================
+// ACCELERATION / DECELERATION
+// =====================================================
+
+void updateRamp() {
+    uint32_t now = millis();
+
+    if (now - lastRampMs < 100) return;
+
+    float dt = (now - lastRampMs) / 1000.0f;
+    lastRampMs = now;
+
+    float desiredRPM = motorRequested ? targetRPM : 0.0f;
+
+    float change = ACCELERATION_RPM * dt;
+
+    if (currentRPM < desiredRPM) {
+        currentRPM += change;
+
+        if (currentRPM > desiredRPM) {
+            currentRPM = desiredRPM;
+        }
     }
-  }
+    else if (currentRPM > desiredRPM) {
+        currentRPM -= change;
 
-  if (motorRPM < 0.5f) {
-    motorRPM = 0.0f;
-  }
+        if (currentRPM < desiredRPM) {
+            currentRPM = desiredRPM;
+        }
+    }
+
+    if (currentRPM <= 0.0f && !motorRequested) {
+        currentRPM = 0.0f;
+        motorRunning = false;
+        releaseMotor();
+    }
+
+    if (currentRPM > 0.0f) {
+        stepIntervalUs = rpmToDelay(currentRPM);
+    }
 }
 
 // =====================================================
-// 17. ГЕНЕРИРАНЕ НА СТЪПКИ СПОРЕД RPM
+// INTERNAL MOTOR STEPPING
 // =====================================================
 
-bool generateMotorStep(bool direction) {
+void updateMotor() {
+    if (!motorRunning) return;
 
-  if (motorRPM <= 0.0f) {
-    return false;
-  }
+    if (currentMode == MODE_STEP_DIR) {
+        return;
+    }
 
-  unsigned long interval = rpmToDelay(motorRPM);
+    if (currentRPM <= 0.0f) return;
 
-  unsigned long now = micros();
+    uint32_t now = micros();
 
-  if (now - lastMotorStepTime >= interval) {
+    if ((uint32_t)(now - lastStepUs) >= stepIntervalUs) {
+        lastStepUs = now;
 
-    lastMotorStepTime = now;
+        executeStep(motorDirection);
 
-    executeStep(direction);
+        if (stepsRemaining > 0) {
+            stepsRemaining--;
 
-    return true;
-  }
-
-  return false;
+            if (stepsRemaining == 0) {
+                stopMotor();
+            }
+        }
+    }
 }
 
 // =====================================================
-// 18. СМЯНА НА РЕЖИМ
-// =====================================================
-
-void changeMode(ControlMode newMode) {
-
-  manualRunRequest = false;
-  manualDirectionPending = false;
-
-  mbIsRunning = false;
-  mbStopRequested = false;
-  mbStepsRemaining = 0;
-
-  motorRPM = 0.0f;
-
-  releaseMotor();
-
-  noInterrupts();
-
-  stepDirEnabled = false;
-
-  pendingForwardSteps = 0;
-  pendingBackwardSteps = 0;
-
-  currentMode = newMode;
-
-  stepDirEnabled = (newMode == MODE_STEP_DIR);
-
-  interrupts();
-
-  holdingRegisters[10] = (uint16_t)newMode;
-
-  lastMotorStepTime = micros();
-  lastRampTime = millis();
-
-  lastClkState = digitalRead(ENC_CLK);
-}
-
-// =====================================================
-// 19. СЛЕДВАЩ РЕЖИМ
-// =====================================================
-
-void nextMode() {
-
-  if (currentMode == MODE_MODBUS) {
-    changeMode(MODE_STEP_DIR);
-  }
-
-  else if (currentMode == MODE_STEP_DIR) {
-    changeMode(MODE_MANUAL);
-  }
-
-  else {
-    changeMode(MODE_MODBUS);
-  }
-}
-
-// =====================================================
-// 20. STEP / DIR INTERRUPT
+// EXTERNAL STEP INTERRUPTS
 // =====================================================
 
 void handleExternalStep() {
-
-  if (!stepDirEnabled) return;
-
-  if (digitalRead(DIR_PIN) == HIGH) {
-
-    if (pendingForwardSteps < 100000UL) {
-      pendingForwardSteps++;
+    if (digitalRead(DIR_PIN)) {
+        pendingStepsForward++;
+    } else {
+        pendingStepsBackward++;
     }
-  }
+}
 
-  else {
+void updateExternalSteps() {
+    if (currentMode != MODE_STEP_DIR) return;
 
-    if (pendingBackwardSteps < 100000UL) {
-      pendingBackwardSteps++;
+    uint32_t forward = 0;
+    uint32_t backward = 0;
+
+    noInterrupts();
+
+    if (pendingStepsForward > 0) {
+        forward = pendingStepsForward;
+        pendingStepsForward = 0;
     }
-  }
+
+    if (pendingStepsBackward > 0) {
+        backward = pendingStepsBackward;
+        pendingStepsBackward = 0;
+    }
+
+    interrupts();
+
+    // Изпълняваме натрупаните външни стъпки
+    while (forward > 0) {
+        executeStep(1);
+        forward--;
+    }
+
+    while (backward > 0) {
+        executeStep(-1);
+        backward--;
+    }
 }
 
 // =====================================================
-// 21. STEP / DIR ОБРАБОТКА
+// ENCODER
 // =====================================================
 
-void handleStepDir() {
-
-  bool direction = false;
-  bool hasStep = false;
-
-  noInterrupts();
-
-  if (pendingForwardSteps > 0) {
-
-    pendingForwardSteps--;
-    direction = true;
-    hasStep = true;
-  }
-
-  else if (pendingBackwardSteps > 0) {
-
-    pendingBackwardSteps--;
-    direction = false;
-    hasStep = true;
-  }
-
-  interrupts();
-
-  if (hasStep) {
-    executeStep(direction);
-  }
-}
-
-// =====================================================
-// 22. MANUAL - РЕГУЛИРАНЕ НА СКОРОСТТА
-// =====================================================
-
-void handleManualEncoderSpeed() {
-
-  int clk = digitalRead(ENC_CLK);
-
-  if (clk != lastClkState && clk == LOW) {
-
-    bool rotationRight =
-      (digitalRead(ENC_DT) != clk);
-
-    if (rotationRight) {
-
-      // Увеличаване на оборотите
-
-      if (manualStepDelay > MIN_DELAY_US) {
-
-        manualStepDelay -= SPEED_STEP_US;
-
-        if (manualStepDelay < MIN_DELAY_US) {
-          manualStepDelay = MIN_DELAY_US;
-        }
-      }
+void nextMode() {
+    if (currentMode == MODE_MANUAL) {
+        currentMode = MODE_MODBUS;
     }
-
+    else if (currentMode == MODE_MODBUS) {
+        currentMode = MODE_STEP_DIR;
+    }
     else {
+        currentMode = MODE_MANUAL;
+    }
 
-      // Намаляване на оборотите
+    stopMotor();
+    stepsRemaining = 0;
+}
 
-      if (manualStepDelay < MAX_DELAY_US) {
 
-        manualStepDelay += SPEED_STEP_US;
+void updateEncoder() {
+    static uint32_t lastEncoderChangeMs = 0;
 
-        if (manualStepDelay > MAX_DELAY_US) {
-          manualStepDelay = MAX_DELAY_US;
+    int clk = digitalRead(ENC_CLK);
+    int dt  = digitalRead(ENC_DT);
+
+    // Отчитаме промяна на CLK
+    if (clk != lastEncoderCLK) {
+        uint32_t now = millis();
+
+        // Филтър срещу механични смущения
+        if (now - lastEncoderChangeMs >= 2) {
+            lastEncoderChangeMs = now;
+
+            if (clk == LOW) {
+                if (dt != clk) {
+                    targetRPM += 5.0f;
+                } else {
+                    targetRPM -= 5.0f;
+                }
+
+                targetRPM = constrain(targetRPM, MIN_RPM, MAX_RPM);
+            }
         }
-      }
     }
 
-    manualTargetRPM =
-      delayToRPM(manualStepDelay);
-  }
+    lastEncoderCLK = clk;
 
-  lastClkState = clk;
+    // Бутон на енкодера
+    bool buttonState = digitalRead(ENC_SW);
+
+    if (lastButtonState == HIGH && buttonState == LOW) {
+        buttonPressed = true;
+        buttonPressTime = millis();
+    }
+
+    if (lastButtonState == LOW &&
+        buttonState == HIGH &&
+        buttonPressed) {
+
+        uint32_t pressDuration = millis() - buttonPressTime;
+        buttonPressed = false;
+
+        if (pressDuration < SHORT_PRESS_MS) {
+            if (motorRequested) {
+                stopMotor();
+            } else {
+                startMotor();
+            }
+        }
+        else if (pressDuration < LONG_PRESS_MS) {
+            setDirection(-motorDirection);
+        }
+        else {
+            nextMode();
+        }
+    }
+
+    lastButtonState = buttonState;
+}
+
+
+// =====================================================
+// MODBUS CRC16
+// =====================================================
+
+uint16_t modbusCRC(uint8_t *data, uint8_t length) {
+    uint16_t crc = 0xFFFF;
+
+    for (uint8_t i = 0; i < length; i++) {
+        crc ^= data[i];
+
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return crc;
 }
 
 // =====================================================
-// 23. MANUAL - START / STOP / DIRECTION
-// =====================================================
-
-void handleManualButtonAction(unsigned long duration) {
-
-  // Кратко натискане
-
-  if (duration < 800) {
-
-    manualRunRequest = !manualRunRequest;
-
-    manualDirectionPending = false;
-
-    if (manualRunRequest) {
-      lastMotorStepTime = micros();
-    }
-  }
-
-  // Средно задържане - смяна на посоката
-
-  else if (duration < 3000) {
-
-    if (manualRunRequest || motorRPM > 0.0f) {
-
-      // Първо спираме плавно
-      manualRunRequest = false;
-
-      pendingDirection = !manualDirection;
-
-      manualDirectionPending = true;
-    }
-
-    else {
-
-      manualDirection = !manualDirection;
-    }
-  }
-
-  // Над 3 секунди - смяна на режим
-
-  else {
-
-    nextMode();
-  }
-}
-
-// =====================================================
-// 24. MANUAL - ПЛАВНО ДВИЖЕНИЕ
-// =====================================================
-
-void handleManualMotor() {
-
-  float targetRPM = 0.0f;
-
-  if (manualRunRequest) {
-    targetRPM = manualTargetRPM;
-  }
-
-  updateMotorRamp(targetRPM);
-
-  // Когато достигнем нула при смяна на посоката
-
-  if (motorRPM == 0.0f &&
-      manualDirectionPending) {
-
-    manualDirection = pendingDirection;
-
-    manualDirectionPending = false;
-
-    // Автоматично стартиране в новата посока
-    manualRunRequest = true;
-
-    lastMotorStepTime = micros();
-  }
-
-  // Плавно спиране
-
-  if (motorRPM == 0.0f && !manualRunRequest) {
-
-    releaseMotor();
-    return;
-  }
-
-  generateMotorStep(manualDirection);
-}
-
-// =====================================================
-// 25. MODBUS CRC16
-// =====================================================
-
-uint16_t calculateCRC(uint8_t *data, uint8_t length) {
-
-  uint16_t crc = 0xFFFF;
-
-  for (uint8_t i = 0; i < length; i++) {
-
-    crc ^= data[i];
-
-    for (uint8_t j = 0; j < 8; j++) {
-
-      if (crc & 1) {
-        crc = (crc >> 1) ^ 0xA001;
-      }
-      else {
-        crc >>= 1;
-      }
-    }
-  }
-
-  return crc;
-}
-
-// =====================================================
-// 26. MODBUS ОТГОВОР
+// MODBUS RESPONSE
 // =====================================================
 
 void sendModbusResponse(uint8_t *data, uint8_t length) {
+    uint16_t crc = modbusCRC(data, length);
 
-  uint16_t crc = calculateCRC(data, length);
+    data[length] = crc & 0xFF;
+    data[length + 1] = crc >> 8;
 
-  data[length] = crc & 0xFF;
-  data[length + 1] = crc >> 8;
+    digitalWrite(RS485_DE_RE, HIGH);
+    delayMicroseconds(100);
 
-  digitalWrite(MAX485_DE_RE_PIN, HIGH);
+    RS485_SERIAL.write(data, length + 2);
+    RS485_SERIAL.flush();
 
-  delayMicroseconds(50);
-
-  RS485_SERIAL.write(data, length + 2);
-  RS485_SERIAL.flush();
-
-  delayMicroseconds(50);
-
-  digitalWrite(MAX485_DE_RE_PIN, LOW);
+    delayMicroseconds(100);
+    digitalWrite(RS485_DE_RE, LOW);
 }
 
 // =====================================================
-// 27. MODBUS КОМАНДИ
+// APPLY MODBUS SETTINGS
 // =====================================================
 
-void pollModbusSlave() {
+void applyModbusSettings() {
+    setDirection(holdingRegisters[1] == 0 ? 1 : -1);
 
-  if (RS485_SERIAL.available() < 8) return;
+    uint32_t delayValue = holdingRegisters[2];
 
-  uint8_t buffer[8];
+    if (delayValue < 1000) delayValue = 1000;
+    if (delayValue > 10000) delayValue = 10000;
 
-  for (int i = 0; i < 8; i++) {
-    buffer[i] = RS485_SERIAL.read();
-  }
+    targetRPM = delayToRPM(delayValue);
 
-  if (buffer[0] != 1) return;
+    uint16_t mode = holdingRegisters[10];
 
-  uint16_t receivedCRC =
-    buffer[6] | (buffer[7] << 8);
-
-  uint16_t calculatedCRC =
-    calculateCRC(buffer, 6);
-
-  if (receivedCRC != calculatedCRC) return;
-
-  uint16_t regAddr =
-    (buffer[2] << 8) | buffer[3];
-
-  // WRITE SINGLE REGISTER
-
-  if (buffer[1] == 0x06) {
-
-    uint16_t value =
-      (buffer[4] << 8) | buffer[5];
-
-    if (regAddr < 16) {
-
-      holdingRegisters[regAddr] = value;
-
-      sendModbusResponse(buffer, 6);
-    }
-  }
-
-  // READ HOLDING REGISTERS
-
-  else if (buffer[1] == 0x03) {
-
-    uint16_t quantity =
-      (buffer[4] << 8) | buffer[5];
-
-    if (quantity == 0 ||
-        quantity > 16 ||
-        regAddr + quantity > 16) {
-      return;
+    if (mode >= MODE_MODBUS && mode <= MODE_MANUAL) {
+        currentMode = (OperatingMode)mode;
     }
 
-    uint8_t response[37];
-
-    response[0] = 1;
-    response[1] = 0x03;
-    response[2] = quantity * 2;
-
-    for (uint16_t i = 0; i < quantity; i++) {
-
-      response[3 + i * 2] =
-        holdingRegisters[regAddr + i] >> 8;
-
-      response[4 + i * 2] =
-        holdingRegisters[regAddr + i] & 0xFF;
+    if (holdingRegisters[3] == 1) {
+        stepsRemaining = holdingRegisters[0];
+        startMotor();
+    } else {
+        stopMotor();
     }
-
-    sendModbusResponse(response, 3 + quantity * 2);
-  }
 }
 
 // =====================================================
-// 28. MODBUS - ПЛАВНО УСКОРЯВАНЕ И СПИРАНЕ
+// MODBUS FRAME PROCESSING
+// FC03 - Read Holding Registers
+// FC06 - Write Single Register
 // =====================================================
 
-void handleModbusMotor() {
+void processModbusFrame() {
+    if (modbusLength < 8) return;
 
-  // START
+    if (modbusBuffer[0] != MODBUS_SLAVE_ID) return;
 
-  if (!mbIsRunning && holdingRegisters[3] == 1) {
+    uint16_t receivedCRC =
+        modbusBuffer[modbusLength - 2] |
+        ((uint16_t)modbusBuffer[modbusLength - 1] << 8);
 
-    mbStepsRemaining = holdingRegisters[0];
+    uint16_t calculatedCRC =
+        modbusCRC(modbusBuffer, modbusLength - 2);
 
-    mbDirection = holdingRegisters[1] != 0;
+    if (receivedCRC != calculatedCRC) return;
 
-    unsigned long requestedDelay =
-      holdingRegisters[2];
+    uint8_t function = modbusBuffer[1];
 
-    if (requestedDelay < MIN_DELAY_US) {
-      requestedDelay = MIN_DELAY_US;
-    }
+    // FC03 - Read Holding Registers
+    if (function == 0x03 && modbusLength == 8) {
+        uint16_t startAddress =
+            ((uint16_t)modbusBuffer[2] << 8) |
+            modbusBuffer[3];
 
-    if (requestedDelay > MAX_DELAY_US) {
-      requestedDelay = MAX_DELAY_US;
-    }
+        uint16_t quantity =
+            ((uint16_t)modbusBuffer[4] << 8) |
+            modbusBuffer[5];
 
-    mbTargetRPM = delayToRPM(requestedDelay);
-
-    mbStopRequested = false;
-
-    if (mbStepsRemaining > 0) {
-
-      mbIsRunning = true;
-
-      lastMotorStepTime = micros();
-    }
-
-    holdingRegisters[3] = 0;
-  }
-
-  // STOP команда = 2
-
-  if (holdingRegisters[3] == 2) {
-
-    mbStopRequested = true;
-
-    holdingRegisters[3] = 0;
-  }
-
-  if (!mbIsRunning) {
-
-    releaseMotor();
-    return;
-  }
-
-  float desiredRPM = mbTargetRPM;
-
-  // Плавно спиране при STOP
-
-  if (mbStopRequested) {
-
-    desiredRPM = 0.0f;
-  }
-
-  // Автоматично забавяне преди края на движението
-  // Ускорение 60 RPM/s = 200 стъпки/s^2
-
-  else if (mbStepsRemaining > 0) {
-
-    float accelerationSteps = 200.0f;
-
-    float brakingRPM = sqrtf(
-      2.0f * accelerationSteps *
-      (float)mbStepsRemaining
-    ) * 60.0f / MOTOR_STEPS_PER_REV;
-
-    if (brakingRPM < desiredRPM) {
-      desiredRPM = brakingRPM;
-    }
-  }
-
-  updateMotorRamp(desiredRPM);
-
-  // Когато моторът спре
-
-  if (motorRPM == 0.0f &&
-      (mbStopRequested || mbStepsRemaining <= 0)) {
-
-    mbIsRunning = false;
-    mbStopRequested = false;
-
-    releaseMotor();
-
-    return;
-  }
-
-  // Генериране на стъпки
-
-  if (generateMotorStep(mbDirection)) {
-
-    if (mbStepsRemaining > 0) {
-      mbStepsRemaining--;
-    }
-  }
-}
-
-// =====================================================
-// 29. ОБРАБОТКА НА ЕНКОДЕРА И БУТОНА
-// =====================================================
-
-void handleEncoderButton() {
-
-  bool button = digitalRead(ENC_SW);
-
-  if (button != buttonRawState) {
-
-    buttonRawState = button;
-
-    buttonDebounceTime = millis();
-  }
-
-  if (millis() - buttonDebounceTime >= DEBOUNCE_MS) {
-
-    if (button != buttonStableState) {
-
-      buttonStableState = button;
-
-      if (buttonStableState == LOW) {
-
-        buttonPressTime = millis();
-      }
-
-      else {
-
-        unsigned long duration =
-          millis() - buttonPressTime;
-
-        if (currentMode == MODE_MANUAL) {
-
-          handleManualButtonAction(duration);
+        if (quantity == 0 ||
+            quantity > 16 ||
+            startAddress + quantity > 16) {
+            return;
         }
 
-        else {
+        uint8_t response[40];
 
-          if (duration < 800 || duration >= 3000) {
-            nextMode();
-          }
+        response[0] = MODBUS_SLAVE_ID;
+        response[1] = 0x03;
+        response[2] = quantity * 2;
+
+        for (uint16_t i = 0; i < quantity; i++) {
+            uint16_t value = holdingRegisters[startAddress + i];
+
+            response[3 + i * 2] = value >> 8;
+            response[4 + i * 2] = value & 0xFF;
         }
-      }
+
+        sendModbusResponse(response, 3 + quantity * 2);
     }
-  }
+
+    // FC06 - Write Single Register
+    else if (function == 0x06 && modbusLength == 8) {
+        uint16_t address =
+            ((uint16_t)modbusBuffer[2] << 8) |
+            modbusBuffer[3];
+
+        uint16_t value =
+            ((uint16_t)modbusBuffer[4] << 8) |
+            modbusBuffer[5];
+
+        if (address >= 16) return;
+
+        holdingRegisters[address] = value;
+
+        applyModbusSettings();
+
+        uint8_t response[8];
+
+        for (uint8_t i = 0; i < 6; i++) {
+            response[i] = modbusBuffer[i];
+        }
+
+        sendModbusResponse(response, 6);
+    }
 }
 
 // =====================================================
-// 30. OLED ДИСПЛЕЙ
+// MODBUS RECEIVE
 // =====================================================
+
+void updateModbus() {
+    while (RS485_SERIAL.available()) {
+        uint8_t b = RS485_SERIAL.read();
+
+        if (modbusLength < sizeof(modbusBuffer)) {
+            modbusBuffer[modbusLength++] = b;
+        } else {
+            modbusLength = 0;
+        }
+
+        lastModbusByteMs = millis();
+    }
+
+    // RTU frame: обработка след пауза между байтовете
+    if (modbusLength > 0 &&
+        millis() - lastModbusByteMs >= 5) {
+
+        processModbusFrame();
+        modbusLength = 0;
+    }
+}
+
+// =====================================================
+// OLED DISPLAY
+// =====================================================
+
+
 
 void updateDisplay() {
+    display.clearBuffer();
 
-  display.clearDisplay();
+    char buffer[32];
 
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+    // Режим - по-едър шрифт
+    display.setFont(u8g2_font_7x14_tf);
 
-  display.setCursor(0, 0);
-  display.print("STEPPER CONTROLLER");
+    snprintf(buffer, sizeof(buffer), "%s", getModeName());
+    display.drawStr(0, 13, buffer);
 
-  display.setCursor(0, 12);
-  display.print("Mode: ");
+    // Състояние
+    display.setFont(u8g2_font_6x10_tf);
 
-  if (currentMode == MODE_MODBUS) {
-    display.print("MODBUS");
-  }
+    display.drawStr(88, 13,
+                    motorRequested ? "RUN" : "STOP");
 
-  else if (currentMode == MODE_STEP_DIR) {
-    display.print("STEP / DIR");
-  }
+    // Текущи обороти - голям шрифт
+    display.setFont(u8g2_font_logisoso24_tf);
 
-  else {
-    display.print("MANUAL");
-  }
+    int rpmValue = (int)(currentRPM + 0.5f);
 
-  display.setCursor(0, 25);
+    snprintf(buffer, sizeof(buffer), "%d", rpmValue);
+    display.drawStr(0, 43, buffer);
 
-  display.print("RPM: ");
+    // RPM надпис
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(75, 35, "RPM");
 
-  display.print(motorRPM, 1);
+    // Зададени обороти
+    int setValue = (int)(targetRPM + 0.5f);
 
-  display.setCursor(0, 37);
+    snprintf(buffer, sizeof(buffer), "SET: %d", setValue);
+    display.drawStr(0, 60, buffer);
 
-  display.print("Target: ");
-
-  if (currentMode == MODE_MANUAL) {
-    display.print(manualTargetRPM, 1);
-  }
-
-  else if (currentMode == MODE_MODBUS) {
-    display.print(mbTargetRPM, 1);
-  }
-
-  else {
-    display.print("--");
-  }
-
-  display.setCursor(0, 49);
-
-  if (currentMode == MODE_MANUAL) {
-
-    display.print("Dir: ");
-    display.print(manualDirection ? "RIGHT" : "LEFT");
-
-    display.setCursor(0, 58);
-
-    if (manualRunRequest) {
-      display.print("RUNNING");
+    // Посока
+    if (motorDirection > 0) {
+        display.drawStr(78, 60, "RIGHT");
+    } else {
+        display.drawStr(78, 60, "LEFT");
     }
-    else if (motorRPM > 0.0f) {
-      display.print("STOPPING...");
-    }
-    else {
-      display.print("STOPPED");
-    }
-  }
 
-  else if (currentMode == MODE_MODBUS) {
-
-    display.print("Steps: ");
-    display.print(mbStepsRemaining);
-
-    display.setCursor(0, 58);
-
-    display.print(mbIsRunning ? "RUNNING" : "STOPPED");
-  }
-
-  else {
-
-    display.print("External pulses");
-
-    display.setCursor(0, 58);
-    display.print("Waiting...");
-  }
-
-  display.display();
+    display.sendBuffer();
 }
 
+
+
 // =====================================================
-// 31. SETUP
+// SETUP
 // =====================================================
 
 void setup() {
+    // Освобождаваме PB3/PB4 от JTAG, като запазваме SWD.
+    #if defined(__HAL_AFIO_REMAP_SWJ_NOJTAG)
+        __HAL_AFIO_REMAP_SWJ_NOJTAG();
+    #endif
 
-  // L298N
+    // L298N
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
 
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+    releaseMotor();
 
-  releaseMotor();
+    // STEP / DIR
+    pinMode(STEP_PIN, INPUT_PULLDOWN);
+    pinMode(DIR_PIN, INPUT_PULLDOWN);
 
-  // STEP / DIR
+    attachInterrupt(
+        digitalPinToInterrupt(STEP_PIN),
+        handleExternalStep,
+        RISING
+    );
 
-  pinMode(STEP_PIN, INPUT_PULLUP);
-  pinMode(DIR_PIN, INPUT_PULLUP);
+    // Encoder
+    pinMode(ENC_CLK, INPUT_PULLUP);
+    pinMode(ENC_DT, INPUT_PULLUP);
+    pinMode(ENC_SW, INPUT_PULLUP);
 
-  attachInterrupt(
-    digitalPinToInterrupt(STEP_PIN),
-    handleExternalStep,
-    RISING
-  );
+    lastEncoderCLK = digitalRead(ENC_CLK);
 
-  // Енкодер
+    // RS485
+    pinMode(RS485_DE_RE, OUTPUT);
+    digitalWrite(RS485_DE_RE, LOW);
 
-  pinMode(ENC_CLK, INPUT_PULLUP);
-  pinMode(ENC_DT, INPUT_PULLUP);
-  pinMode(ENC_SW, INPUT_PULLUP);
+    RS485_SERIAL.begin(MODBUS_BAUD, SERIAL_8N1);
 
-  lastClkState = digitalRead(ENC_CLK);
+    // OLED
+    display.begin();
+    display.setContrast(255);
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 20, "STEPPER CONTROLLER");
+    display.drawStr(0, 40, "INITIALIZING...");
+    display.sendBuffer();
 
-  buttonRawState = digitalRead(ENC_SW);
-  buttonStableState = buttonRawState;
+    // Modbus defaults
+    holdingRegisters[0] = 0;
+    holdingRegisters[1] = 0;
+    holdingRegisters[2] = 5000;
+    holdingRegisters[3] = 0;
+    holdingRegisters[10] = MODE_MANUAL;
 
-  // OLED
+    lastRampMs = millis();
+    lastDisplayMs = millis();
 
-  display.begin(
-    SSD1306_SWITCHCAPVCC,
-    0x3C
-  );
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.display();
-
-  // RS485
-
-  pinMode(MAX485_DE_RE_PIN, OUTPUT);
-
-  digitalWrite(MAX485_DE_RE_PIN, LOW);
-
-  RS485_SERIAL.begin(9600, SERIAL_8N1);
-
-  // Начални времена
-
-  lastRampTime = millis();
-  lastMotorStepTime = micros();
-
-  // Начална скорост
-
-  manualStepDelay = 5000;
-  manualTargetRPM = 60.0f;
-
-  currentMode = MODE_MODBUS;
-  stepDirEnabled = false;
+    delay(1000);
 }
 
 // =====================================================
-// 32. MAIN LOOP
+// MAIN LOOP
 // =====================================================
 
 void loop() {
+    updateModbus();
 
-  // 1. Modbus комуникация
+    updateEncoder();
 
-  pollModbusSlave();
+    updateExternalSteps();
 
-  // 2. Синхронизация на режима
+    updateRamp();
 
-  int requestedMode = holdingRegisters[10];
+    updateMotor();
 
-  if (requestedMode >= 1 && requestedMode <= 3) {
-
-    if (requestedMode != currentMode) {
-
-      changeMode((ControlMode)requestedMode);
+    if (millis() - lastDisplayMs >= 250) {
+        lastDisplayMs = millis();
+        updateDisplay();
     }
-  }
-
-  // 3. Енкодер
-
-  handleEncoderButton();
-
-  // 4. Управление на мотора
-
-  switch (currentMode) {
-
-    case MODE_MODBUS:
-
-      handleModbusMotor();
-
-      break;
-
-    case MODE_STEP_DIR:
-
-      handleStepDir();
-
-      break;
-
-    case MODE_MANUAL:
-
-      handleManualEncoderSpeed();
-
-      handleManualMotor();
-
-      break;
-  }
-
-  // 5. OLED
-
-  if (millis() - lastDisplayUpdate >= 250) {
-
-    lastDisplayUpdate = millis();
-
-    updateDisplay();
-  }
 }
